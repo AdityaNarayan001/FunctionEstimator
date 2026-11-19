@@ -2,6 +2,7 @@
   "name": "function-estimator",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "node tests/smoke.test.mjs",
