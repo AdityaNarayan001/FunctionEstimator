@@ -20,6 +20,18 @@ const candidateList = document.querySelector("#candidateList");
 const plotCanvas = document.querySelector("#plotCanvas");
 const plotContext = plotCanvas.getContext("2d");
 
+// Logical drawing size (16:9, matching the CSS aspect ratio). The backing
+// store is scaled by devicePixelRatio so the plot stays sharp on dense screens.
+const PLOT_WIDTH = 960;
+const PLOT_HEIGHT = 540;
+
+function setupCanvas() {
+  const ratio = Math.max(1, window.devicePixelRatio || 1);
+  plotCanvas.width = Math.round(PLOT_WIDTH * ratio);
+  plotCanvas.height = Math.round(PLOT_HEIGHT * ratio);
+  plotContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+}
+
 const inputs = {
   populationSize: document.querySelector("#populationInput"),
   generations: document.querySelector("#generationsInput"),
@@ -33,8 +45,8 @@ let currentWorker = null;
 let lastResult = null;
 let currentPoints = [];
 
+setupCanvas();
 loadExample("quadratic");
-drawEmptyPlot();
 
 document.querySelectorAll("[data-example]").forEach((button) => {
   button.addEventListener("click", () => loadExample(button.dataset.example));
@@ -54,14 +66,14 @@ clearButton.addEventListener("click", () => {
 
 pasteButton.addEventListener("click", () => {
   const parsed = parsePointText(pasteInput.value);
-  if (parsed.errors.length > 0) {
-    setDataMessage(parsed.errors.join(" "));
-  }
+  const skipped = parsed.errors.length > 0 ? `Skipped ${parsed.errors.length}: ${parsed.errors.join("; ")}.` : "";
   if (parsed.points.length > 0) {
     currentPoints = parsed.points;
     renderTable();
-    setDataMessage(`Imported ${parsed.points.length} points.`);
+    setDataMessage(`Imported ${parsed.points.length} points. ${skipped}`.trim());
     resetResult();
+  } else {
+    setDataMessage(skipped || "Nothing to import.");
   }
 });
 
@@ -186,9 +198,9 @@ function stopSearch(updateStatus = true) {
     return;
   }
 
-  currentWorker.postMessage({ type: "stop" });
-  currentWorker.terminate();
-  currentWorker = null;
+  // The search is one synchronous loop inside the worker, so it cannot read a
+  // "stop" message mid-run. Terminating the worker is what stops it; the last
+  // progress result stays on screen.
   finishRun();
   if (updateStatus) {
     runStatus.textContent = "Stopped.";
@@ -211,11 +223,8 @@ function handleWorkerMessage(event) {
     runStatus.textContent = "Done.";
     progressFill.style.width = "100%";
     finishRun();
-  } else if (message.type === "stopped") {
-    runStatus.textContent = "Stopped.";
-    finishRun();
   } else if (message.type === "progress") {
-    const generations = Number(inputs.generations.value) || 1;
+    const generations = message.result.config?.generations || 1;
     const progress = Math.min(100, (message.result.generation / generations) * 100);
     progressFill.style.width = `${progress}%`;
     runStatus.textContent = `Generation ${message.result.generation}`;
@@ -274,8 +283,8 @@ function renderCandidates(candidates) {
 }
 
 function drawEmptyPlot() {
-  const width = plotCanvas.width;
-  const height = plotCanvas.height;
+  const width = PLOT_WIDTH;
+  const height = PLOT_HEIGHT;
   plotContext.clearRect(0, 0, width, height);
   plotContext.fillStyle = "#fffdf8";
   plotContext.fillRect(0, 0, width, height);
@@ -306,19 +315,30 @@ function drawPlot(predictions, curve) {
     return;
   }
 
-  const width = plotCanvas.width;
-  const height = plotCanvas.height;
+  const width = PLOT_WIDTH;
+  const height = PLOT_HEIGHT;
   const padding = { left: 54, right: 34, top: 28, bottom: 48 };
-  const allPoints = [
-    ...predictions.map((point) => ({ x: point.x, y: point.y })),
-    ...predictions.map((point) => ({ x: point.x, y: point.predicted })),
-    ...curve
-  ].filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  const isFinitePoint = (point) => Number.isFinite(point.x) && Number.isFinite(point.y);
+  const dataPoints = predictions.map((point) => ({ x: point.x, y: point.y })).filter(isFinitePoint);
+  const curvePoints = curve.filter(isFinitePoint);
+  const xSource = [...dataPoints, ...curvePoints];
+  const ySource = dataPoints.length > 0 ? dataPoints : curvePoints;
 
-  let minX = Math.min(...allPoints.map((point) => point.x));
-  let maxX = Math.max(...allPoints.map((point) => point.x));
-  let minY = Math.min(...allPoints.map((point) => point.y));
-  let maxY = Math.max(...allPoints.map((point) => point.y));
+  let minX = Math.min(...xSource.map((point) => point.x));
+  let maxX = Math.max(...xSource.map((point) => point.x));
+  let minY = Math.min(...ySource.map((point) => point.y));
+  let maxY = Math.max(...ySource.map((point) => point.y));
+
+  // The training data sets the y-range. The curve may widen it by at most one
+  // data-span per side, so a pole or a blow-up between points cannot flatten
+  // the data into a line; whatever falls outside is clipped.
+  if (dataPoints.length > 0 && curvePoints.length > 0) {
+    const span = Math.max(maxY - minY, 1);
+    const curveMin = Math.min(...curvePoints.map((point) => point.y));
+    const curveMax = Math.max(...curvePoints.map((point) => point.y));
+    minY = Math.max(Math.min(minY, curveMin), minY - span);
+    maxY = Math.min(Math.max(maxY, curveMax), maxY + span);
+  }
 
   if (Math.abs(maxX - minX) < 0.000001) {
     minX -= 1;
@@ -341,12 +361,23 @@ function drawPlot(predictions, curve) {
   plotContext.fillRect(0, 0, width, height);
   drawGrid(width, height, padding, minX, maxX, minY, maxY, toCanvasX, toCanvasY);
 
+  plotContext.save();
+  plotContext.beginPath();
+  plotContext.rect(padding.left, padding.top, width - padding.left - padding.right, height - padding.top - padding.bottom);
+  plotContext.clip();
+
   if (curve.length > 1) {
     plotContext.beginPath();
     curve.forEach((point, index) => {
       const x = toCanvasX(point.x);
       const y = toCanvasY(point.y);
-      if (index === 0) {
+      // A jump from above the plot to below it (or back) is a pole, not a
+      // line the function actually follows, so the stroke is broken there.
+      const previous = curve[index - 1];
+      const jumpsAcross =
+        previous &&
+        ((previous.y > maxY && point.y < minY) || (previous.y < minY && point.y > maxY));
+      if (index === 0 || jumpsAcross) {
         plotContext.moveTo(x, y);
       } else {
         plotContext.lineTo(x, y);
@@ -374,6 +405,7 @@ function drawPlot(predictions, curve) {
     plotContext.stroke();
   });
 
+  plotContext.restore();
   drawLegend(width);
 }
 
@@ -431,6 +463,9 @@ function formatMetric(value) {
 }
 
 function formatAxis(value) {
+  if (Math.abs(value) < 1e-9) {
+    return "0";
+  }
   if (Math.abs(value) >= 1000 || Math.abs(value) < 0.01) {
     return value.toExponential(1);
   }

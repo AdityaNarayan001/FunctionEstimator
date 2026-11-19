@@ -3,10 +3,15 @@ import {
   binaryNode,
   constNode,
   evaluateNode,
+  crossoverTrees,
+  createRng,
   evolve,
+  mutateTree,
+  nodeCount,
   parsePointText,
   rowsToPoints,
   simplifyConstants,
+  simplifyTree,
   toFormula,
   unaryNode,
   validatePoints,
@@ -81,7 +86,11 @@ function testFormulaPrinting() {
     [unaryNode("square", unaryNode("sin", x)), "sin(x)^2"],
     [unaryNode("square", binaryNode("add", x, constNode(1))), "(x + 1)^2"],
     [unaryNode("sin", constNode(-3)), "sin(-3)"],
-    [binaryNode("sub", x, binaryNode("sub", x, constNode(1))), "x - (x - 1)"]
+    [binaryNode("sub", x, binaryNode("sub", x, constNode(1))), "x - (x - 1)"],
+    [unaryNode("log", x), "log(abs(x))"],
+    [unaryNode("sqrt", binaryNode("sub", x, constNode(1))), "sqrt(abs(x - 1))"],
+    [unaryNode("sqrt", binaryNode("add", unaryNode("square", x), constNode(1))), "sqrt(x^2 + 1)"],
+    [unaryNode("log", unaryNode("exp", x)), "log(exp(x))"]
   ];
 
   for (const [node, expected] of cases) {
@@ -94,10 +103,13 @@ function testFormulaPrinting() {
     formula
       .replace(/(^|\()-/g, "$10-")
       .replace(/\^2/g, "**2")
-      .replace(/\b(sin|cos|exp|log|sqrt)\(/g, "Math.$1(");
+      .replace(/\b(sin|cos|exp|log|sqrt|abs)\(/g, "Math.$1(");
+  // Checked on both sides of zero, where the protected log and sqrt matter.
   for (const [node] of cases) {
-    const fromText = new Function("x", `return ${toJs(toFormula(node))};`)(1.7);
-    assert.ok(Math.abs(fromText - evaluateNode(node, 1.7)) < 1e-9, `${toFormula(node)} misreads`);
+    for (const sample of [1.7, -2.3]) {
+      const fromText = new Function("x", `return ${toJs(toFormula(node))};`)(sample);
+      assert.ok(Math.abs(fromText - evaluateNode(node, sample)) < 1e-5, `${toFormula(node)} misreads at ${sample}`);
+    }
   }
 }
 
@@ -128,7 +140,66 @@ function testSmoothnessCanBeZero() {
   assert.equal(run(0.5), 0.5);
 }
 
+function testCsvHeaderAfterBlankLine() {
+  const parsed = parsePointText("\n\nx,y\n1,2\n3,4");
+  assert.equal(parsed.points.length, 2);
+  assert.equal(parsed.errors.length, 0);
+}
+
+function testSimplifyTree() {
+  const x = varNode();
+  const cases = [
+    [binaryNode("add", x, constNode(0)), "x"],
+    [binaryNode("mul", constNode(1), x), "x"],
+    [binaryNode("mul", unaryNode("sin", x), constNode(0)), "0"],
+    [binaryNode("sub", unaryNode("sin", x), unaryNode("sin", x)), "0"],
+    [binaryNode("sub", constNode(0), x), "-x"],
+    [binaryNode("div", x, constNode(1)), "x"],
+    [unaryNode("neg", unaryNode("neg", x)), "x"],
+    [binaryNode("add", binaryNode("mul", constNode(2), constNode(3)), binaryNode("mul", x, constNode(1))), "6 + x"],
+    [binaryNode("div", x, x), "x / x"]
+  ];
+  for (const [node, expected] of cases) {
+    const simplified = simplifyTree(node);
+    assert.equal(toFormula(simplified), expected);
+    for (const sample of [-2.5, 0.75, 4]) {
+      assert.ok(Math.abs(evaluateNode(simplified, sample) - evaluateNode(node, sample)) < 1e-9);
+    }
+  }
+}
+
+function testCrossoverAndMutationKeepValidTrees() {
+  const rng = createRng("operators");
+  const first = binaryNode("add", unaryNode("square", varNode()), constNode(1));
+  const second = unaryNode("sin", binaryNode("mul", varNode(), constNode(2)));
+  const firstText = toFormula(first);
+  for (let round = 0; round < 200; round += 1) {
+    const child = mutateTree(crossoverTrees(first, second, rng), rng);
+    assert.ok(nodeCount(child) >= 1);
+    assert.equal(Number.isFinite(evaluateNode(child, 1.3)), true);
+    assert.equal(typeof toFormula(child), "string");
+  }
+  assert.equal(toFormula(first), firstText, "parents must not be modified");
+}
+
+function testSizeCapAndDeterminism() {
+  const points = [0.5, 1, 1.5, 2, 3, 4, 6, 8].map((x) => ({ x, y: 3 / x + x / 2 }));
+  const config = { populationSize: 120, generations: 60, maxNodes: 12, seed: "cap" };
+  const reports = [];
+  const result = evolve(points, config, (progress) => reports.push(progress));
+  assert.ok(reports.length > 2);
+  for (const report of reports) {
+    assert.ok(report.candidates.every((candidate) => candidate.nodeCount <= 12), "size cap must hold in every generation");
+  }
+  assert.equal(new Set(result.candidates.map((candidate) => candidate.formula)).size, result.candidates.length);
+  assert.equal(evolve(points, config).formula, result.formula, "same seed must give the same formula");
+}
+
 testProtectedOperators();
+testCsvHeaderAfterBlankLine();
+testSimplifyTree();
+testCrossoverAndMutationKeepValidTrees();
+testSizeCapAndDeterminism();
 testFormulaPrinting();
 testRowsToPoints();
 testSmoothnessCanBeZero();

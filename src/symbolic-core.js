@@ -96,6 +96,18 @@ export function randomTree(rng, maxDepth = 4) {
   );
 }
 
+// A random tree that respects the size cap: shallower trees are tried until
+// one fits (a depth-0 tree is a single node, so this always ends).
+function boundedRandomTree(rng, maxDepth, maxNodes) {
+  for (let depth = maxDepth; depth > 0; depth -= 1) {
+    const tree = randomTree(rng, depth);
+    if (nodeCount(tree) <= maxNodes) {
+      return tree;
+    }
+  }
+  return randomTerminal(rng);
+}
+
 function randomTerminal(rng) {
   if (rng() < 0.48) {
     return varNode();
@@ -242,6 +254,75 @@ export function simplifyConstants(node) {
   return simplified;
 }
 
+export function nodesEqual(a, b) {
+  if (a.type !== b.type) {
+    return false;
+  }
+  if (a.type === "const") {
+    return a.value === b.value;
+  }
+  if (a.type === "var") {
+    return true;
+  }
+  if (a.type === "unary") {
+    return a.op === b.op && nodesEqual(a.child, b.child);
+  }
+  return a.op === b.op && nodesEqual(a.left, b.left) && nodesEqual(a.right, b.right);
+}
+
+// Constant folding plus the algebraic identities that never change the value:
+// a + 0, a - 0, 0 - a, a - a, a * 1, a * 0, a / 1, 0 / a and -(-a).
+export function simplifyTree(node) {
+  if (node.type === "const" || node.type === "var") {
+    return cloneNode(node);
+  }
+
+  if (node.type === "unary") {
+    const child = simplifyTree(node.child);
+    if (child.type === "const") {
+      return constNode(evaluateNode(unaryNode(node.op, child), 0));
+    }
+    if (node.op === "neg" && child.type === "unary" && child.op === "neg") {
+      return child.child;
+    }
+    return unaryNode(node.op, child);
+  }
+
+  const left = simplifyTree(node.left);
+  const right = simplifyTree(node.right);
+  const isConst = (candidate, value) => candidate.type === "const" && candidate.value === value;
+
+  if (left.type === "const" && right.type === "const") {
+    return constNode(evaluateNode(binaryNode(node.op, left, right), 0));
+  }
+
+  if (node.op === "add") {
+    if (isConst(left, 0)) return right;
+    if (isConst(right, 0)) return left;
+  } else if (node.op === "sub") {
+    if (isConst(right, 0)) return left;
+    if (isConst(left, 0)) return unaryNode("neg", right);
+    if (nodesEqual(left, right)) return constNode(0);
+  } else if (node.op === "mul") {
+    if (isConst(left, 0) || isConst(right, 0)) return constNode(0);
+    if (isConst(left, 1)) return right;
+    if (isConst(right, 1)) return left;
+  } else if (node.op === "div") {
+    if (isConst(right, 1)) return left;
+    if (isConst(left, 0)) return constNode(0);
+  }
+
+  return binaryNode(node.op, left, right);
+}
+
+// Subtree crossover: a random subtree of the first parent is replaced by a
+// random subtree of the second.
+export function crossoverTrees(first, second, rng) {
+  const target = choose(rng, collectPaths(first));
+  const donor = getNodeAt(second, choose(rng, collectPaths(second)));
+  return replaceAt(first, target, donor);
+}
+
 export function mutateTree(node, rng, options = {}) {
   const maxDepth = options.maxDepth ?? 4;
   const root = cloneNode(node);
@@ -348,7 +429,13 @@ function formatNode(node, parentPrecedence) {
       const text = `${formatNode(node.child, 5)}^2`;
       return parentPrecedence >= 5 ? `(${text})` : text;
     }
-    return `${node.op}(${formatNode(node.child, 0)})`;
+    // log and sqrt are evaluated on the absolute value of their input, so the
+    // printed formula says so unless the input can never be negative.
+    const inner = formatNode(node.child, 0);
+    if ((node.op === "log" || node.op === "sqrt") && !isNonNegative(node.child)) {
+      return `${node.op}(abs(${inner}))`;
+    }
+    return `${node.op}(${inner})`;
   }
 
   const precedence = node.op === "mul" || node.op === "div" ? 3 : 2;
@@ -359,6 +446,22 @@ function formatNode(node, parentPrecedence) {
   }
   const text = `${formatNode(node.left, precedence)} ${symbol} ${formatNode(node.right, rightPrecedence)}`;
   return precedence < parentPrecedence ? `(${text})` : text;
+}
+
+function isNonNegative(node) {
+  if (node.type === "const") {
+    return node.value >= 0;
+  }
+  if (node.type === "var") {
+    return false;
+  }
+  if (node.type === "unary") {
+    return node.op === "square" || node.op === "sqrt" || node.op === "exp";
+  }
+  if (node.op === "add" || node.op === "mul" || node.op === "div") {
+    return isNonNegative(node.left) && isNonNegative(node.right);
+  }
+  return false;
 }
 
 function printsLeadingMinus(node) {
@@ -383,11 +486,15 @@ export function parsePointText(text) {
   const errors = [];
   const lines = String(text ?? "").split(/\r?\n/);
 
+  let sawContent = false;
+
   lines.forEach((line, index) => {
     const trimmed = line.trim();
     if (!trimmed) {
       return;
     }
+    const isFirstContentLine = !sawContent;
+    sawContent = true;
 
     const parts = trimmed.split(/[\s,;\t]+/).filter(Boolean);
     if (parts.length < 2) {
@@ -398,7 +505,7 @@ export function parsePointText(text) {
     const x = Number(parts[0]);
     const y = Number(parts[1]);
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      const looksLikeHeader = index === 0 && /[a-z]/i.test(trimmed);
+      const looksLikeHeader = isFirstContentLine && /[a-z]/i.test(trimmed);
       if (!looksLikeHeader) {
         errors.push(`Line ${index + 1}: values must be finite numbers`);
       }
@@ -555,7 +662,7 @@ export function evolve(points, config = {}, onProgress = () => {}, shouldStop = 
   let population = seedPopulation(points, runConfig, rng);
 
   while (population.length < runConfig.populationSize) {
-    population.push(randomTree(rng, runConfig.initialDepth));
+    population.push(boundedRandomTree(rng, runConfig.initialDepth, runConfig.maxNodes));
   }
 
   let lastResult = null;
@@ -565,17 +672,16 @@ export function evolve(points, config = {}, onProgress = () => {}, shouldStop = 
       .map((node) => ({ node, score: scoreExpression(node, points, runConfig) }))
       .sort((a, b) => a.score.loss - b.score.loss);
 
-    lastResult = buildFitResult(scored, points, generation, runConfig);
+    const finished = generation === runConfig.generations || shouldStop();
+    const reporting = generation === 0 || generation % runConfig.progressEvery === 0;
 
-    if (
-      generation === 0 ||
-      generation === runConfig.generations ||
-      generation % runConfig.progressEvery === 0
-    ) {
+    // Building a result samples the plot curve, so only do it when it is used.
+    if (finished || reporting) {
+      lastResult = buildFitResult(scored, points, generation, runConfig);
       onProgress(lastResult);
     }
 
-    if (generation === runConfig.generations || shouldStop()) {
+    if (finished) {
       return lastResult;
     }
 
@@ -602,6 +708,9 @@ function normalizeConfig(config) {
     complexityAllowance: clamp(Number(config.complexityAllowance) || 6, 1, 30),
     smoothnessWeight: clamp(smoothnessWeight, 0, 2),
     seed: config.seed ?? "function-estimator",
+    crossoverRate: clamp(Number(config.crossoverRate ?? 0.3) || 0, 0, 1),
+    maxNodes: clampInt(config.maxNodes, 8, 400, 80),
+    dedupe: config.dedupe !== false,
     initialDepth: clampInt(config.initialDepth, 1, 7, 4),
     maxMutationDepth: clampInt(config.maxMutationDepth, 1, 7, 4),
     progressEvery: Math.max(1, Math.floor(clampInt(config.generations, 1, 20000, 1200) / 80))
@@ -622,7 +731,7 @@ function seedPopulation(points, config, rng) {
   }
 
   while (unique.length < Math.min(config.populationSize, 40)) {
-    unique.push(randomTree(rng, 3));
+    unique.push(boundedRandomTree(rng, 3, config.maxNodes));
   }
 
   return unique.slice(0, config.populationSize);
@@ -680,18 +789,40 @@ function nextGeneration(scored, config, rng) {
   const next = [];
   const eliteCount = clamp(Math.ceil(config.populationSize * 0.04), 2, Math.min(20, scored.length));
 
-  for (let index = 0; index < eliteCount; index += 1) {
-    next.push(cloneNode(scored[index].node));
+  const seen = new Set();
+  const isNew = (node) => {
+    if (!config.dedupe) {
+      return true;
+    }
+    const key = toFormula(node);
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  };
+
+  // Elites are the best distinct formulas, so copies of the leader cannot
+  // take every elite slot.
+  for (let index = 0; index < scored.length && next.length < eliteCount; index += 1) {
+    if (isNew(scored[index].node)) {
+      next.push(cloneNode(scored[index].node));
+    }
   }
 
   while (next.length < config.populationSize) {
     if (rng() < 0.05) {
-      next.push(randomTree(rng, config.initialDepth));
+      next.push(boundedRandomTree(rng, config.initialDepth, config.maxNodes));
       continue;
     }
 
     const parent = tournamentSelect(scored, rng);
     let child = cloneNode(parent.node);
+
+    if (rng() < config.crossoverRate) {
+      child = crossoverTrees(child, tournamentSelect(scored, rng).node, rng);
+    }
+
     const mutationPasses = rng() < config.mutationRate ? 1 + (rng() < config.mutationRate * 0.35 ? 1 : 0) : 0;
 
     for (let pass = 0; pass < mutationPasses; pass += 1) {
@@ -699,7 +830,19 @@ function nextGeneration(scored, config, rng) {
     }
 
     if (rng() < 0.22) {
-      child = simplifyConstants(child);
+      child = simplifyTree(child);
+    }
+
+    // A formula already in the next generation gets one more mutation rather
+    // than a second identical slot.
+    if (!isNew(child)) {
+      child = mutateTree(child, rng, { maxDepth: config.maxMutationDepth });
+      isNew(child);
+    }
+
+    // Hard size cap: an oversized child is replaced by its (in-bounds) parent.
+    if (nodeCount(child) > config.maxNodes) {
+      child = cloneNode(parent.node);
     }
 
     next.push(child);
@@ -733,12 +876,7 @@ function buildFitResult(scored, points, generation, config) {
     smoothness: best.score.smoothness,
     predictions: best.score.predictions,
     curve: makeCurve(best.node, points),
-    candidates: scored.slice(0, 10).map((entry) => ({
-      formula: toFormula(entry.node),
-      mse: entry.score.mse,
-      loss: entry.score.loss,
-      nodeCount: entry.score.nodeCount
-    })),
+    candidates: distinctLeaders(scored, 10),
     config: {
       populationSize: config.populationSize,
       generations: config.generations,
@@ -748,6 +886,30 @@ function buildFitResult(scored, points, generation, config) {
       seed: config.seed
     }
   };
+}
+
+// The best `limit` formulas with repeats removed (the population is sorted
+// best-first and can hold the same formula more than once).
+function distinctLeaders(scored, limit) {
+  const leaders = [];
+  const seen = new Set();
+  for (const entry of scored) {
+    const formula = toFormula(entry.node);
+    if (seen.has(formula)) {
+      continue;
+    }
+    seen.add(formula);
+    leaders.push({
+      formula,
+      mse: entry.score.mse,
+      loss: entry.score.loss,
+      nodeCount: entry.score.nodeCount
+    });
+    if (leaders.length === limit) {
+      break;
+    }
+  }
+  return leaders;
 }
 
 export function makeCurve(node, points, sampleCount = 180) {
