@@ -1,4 +1,4 @@
-import { examples, parsePointText, validatePoints } from "./symbolic-core.js";
+import { examples, parsePointText, rowsToPoints, validatePoints } from "./symbolic-core.js";
 
 const tableBody = document.querySelector("#pointTable");
 const pasteInput = document.querySelector("#pasteInput");
@@ -133,9 +133,7 @@ function renderTable() {
 }
 
 function collectPoints() {
-  return currentPoints
-    .map((point) => ({ x: Number(point.x), y: Number(point.y) }))
-    .filter((point) => Number.isFinite(point.x) || Number.isFinite(point.y));
+  return rowsToPoints(currentPoints);
 }
 
 function collectConfig() {
@@ -144,7 +142,7 @@ function collectConfig() {
     generations: Number(inputs.generations.value),
     mutationRate: Number(inputs.mutationRate.value),
     complexityAllowance: Number(inputs.complexityAllowance.value),
-    smoothnessWeight: Number(inputs.smoothnessWeight.value),
+    smoothnessWeight: inputs.smoothnessWeight.value,
     seed: inputs.seed.value || "function-estimator"
   };
 }

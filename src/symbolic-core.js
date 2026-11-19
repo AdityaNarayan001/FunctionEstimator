@@ -327,9 +327,14 @@ export function toFormula(node) {
   return formatNode(node, 0);
 }
 
+// Precedence levels: 2 add/sub, 3 mul/div, 4 unary minus, 5 power.
+// Anything that prints with a leading minus is parenthesized wherever the
+// minus could be misread: under a power, after another minus, or as the
+// right operand of a binary operator.
 function formatNode(node, parentPrecedence) {
   if (node.type === "const") {
-    return formatNumber(node.value);
+    const text = formatNumber(node.value);
+    return text.startsWith("-") && parentPrecedence > 3 ? `(${text})` : text;
   }
   if (node.type === "var") {
     return "x";
@@ -337,21 +342,30 @@ function formatNode(node, parentPrecedence) {
   if (node.type === "unary") {
     if (node.op === "neg") {
       const text = `-${formatNode(node.child, 4)}`;
-      return parentPrecedence > 4 ? `(${text})` : text;
+      return parentPrecedence >= 4 ? `(${text})` : text;
     }
     if (node.op === "square") {
-      const text = `${formatNode(node.child, 4)}^2`;
-      return parentPrecedence > 4 ? `(${text})` : text;
+      const text = `${formatNode(node.child, 5)}^2`;
+      return parentPrecedence >= 5 ? `(${text})` : text;
     }
-    const text = `${node.op}(${formatNode(node.child, 0)})`;
-    return parentPrecedence > 4 ? `(${text})` : text;
+    return `${node.op}(${formatNode(node.child, 0)})`;
   }
 
   const precedence = node.op === "mul" || node.op === "div" ? 3 : 2;
   const symbol = { add: "+", sub: "-", mul: "*", div: "/" }[node.op] ?? "?";
-  const rightPrecedence = node.op === "sub" || node.op === "div" ? precedence + 0.1 : precedence;
+  let rightPrecedence = node.op === "sub" || node.op === "div" ? precedence + 0.1 : precedence;
+  if (printsLeadingMinus(node.right)) {
+    rightPrecedence = 4;
+  }
   const text = `${formatNode(node.left, precedence)} ${symbol} ${formatNode(node.right, rightPrecedence)}`;
   return precedence < parentPrecedence ? `(${text})` : text;
+}
+
+function printsLeadingMinus(node) {
+  if (node.type === "const") {
+    return formatNumber(node.value).startsWith("-");
+  }
+  return node.type === "unary" && node.op === "neg";
 }
 
 function formatNumber(value) {
@@ -395,6 +409,17 @@ export function parsePointText(text) {
   });
 
   return { points, errors };
+}
+
+// Turns raw table rows (strings from inputs) into numeric points. Fully blank
+// rows are dropped; a row with only one value filled keeps a NaN so that
+// validatePoints reports it instead of silently training on 0.
+export function rowsToPoints(rows) {
+  const isBlank = (value) => String(value ?? "").trim() === "";
+  const toNumber = (value) => (isBlank(value) ? Number.NaN : Number(value));
+  return rows
+    .filter((row) => !(isBlank(row.x) && isBlank(row.y)))
+    .map((row) => ({ x: toNumber(row.x), y: toNumber(row.y) }));
 }
 
 export function validatePoints(points) {
@@ -562,12 +587,20 @@ export function evolve(points, config = {}, onProgress = () => {}, shouldStop = 
 
 function normalizeConfig(config) {
   const populationSize = clampInt(config.populationSize, 20, 5000, 600);
+  // 0 is a valid smoothness weight (penalty off), so only fall back to the
+  // default when the value is missing or not a number.
+  const smoothnessInput = config.smoothnessWeight;
+  const smoothnessWeight =
+    smoothnessInput === undefined || smoothnessInput === null || smoothnessInput === "" ||
+    !Number.isFinite(Number(smoothnessInput))
+      ? 0.04
+      : Number(smoothnessInput);
   return {
     populationSize,
     generations: clampInt(config.generations, 1, 20000, 1200),
     mutationRate: clamp(Number(config.mutationRate) || 0.45, 0.05, 1),
     complexityAllowance: clamp(Number(config.complexityAllowance) || 6, 1, 30),
-    smoothnessWeight: clamp(Number(config.smoothnessWeight) || 0.04, 0, 2),
+    smoothnessWeight: clamp(smoothnessWeight, 0, 2),
     seed: config.seed ?? "function-estimator",
     initialDepth: clampInt(config.initialDepth, 1, 7, 4),
     maxMutationDepth: clampInt(config.maxMutationDepth, 1, 7, 4),
